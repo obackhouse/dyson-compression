@@ -2,7 +2,7 @@
 
 This module provides functions to compress the spectral representation of a Green's function or self-energy linked by a Dyson equation
 
-<img src="https://render.githubusercontent.com/render/math?math=\Large G(E) = G_0(E) + G_0(E) \Sigma(E) + G(E)">
+<img src="https://render.githubusercontent.com/render/math?math=\Large G(E) = G_0(E) %2B G_0(E) \Sigma(E) + G(E)">
 
 These dynamical quantities can be written in their spectral representation as a set of causal, separable auxiliary poles
 
