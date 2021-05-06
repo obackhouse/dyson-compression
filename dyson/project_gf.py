@@ -20,7 +20,7 @@ def build_projector(phys, e_aux, v_aux, nmom, debug=False, tol=1e-12, blksize=25
     def _part(w, c, s):
         # Up to order nmom+1 gives consistency up to order 2*nmom+1.
 
-        p = np.zeros((naux, nphys, (nmom+2)))
+        p = np.zeros((naux, nphys, (nmom+2)), dtype=h.dtype)
 
         for p0, p1 in misc.prange(0, np.sum(s), blksize):
             e0 = w[s][p0:p1][None] ** np.arange(nmom+2)[:,None]

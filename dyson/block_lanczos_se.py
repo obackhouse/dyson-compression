@@ -11,7 +11,7 @@ class C:
     ''' Class to contain the recursions.
     '''
 
-    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True, b_method='eig', shifted_chol=True, iterate_chol=True):
+    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True, b_method='eig', shifted_chol=True, iterate_chol=True, allow_non_psd=False):
         self._c = {}
         self._cb_cache = {} if cache else None
         self._mc_cache = {} if cache else None
@@ -23,6 +23,7 @@ class C:
         self.b_method = b_method
         self.shifted_chol = shifted_chol
         self.iterate_chol = iterate_chol
+        self.allow_non_psd = allow_non_psd
         self.dtype = dtype
 
     def __getitem__(self, key):
@@ -66,9 +67,9 @@ class C:
         # Get a cached term c[i,n,j] . b[j].T
         b = env['b']
         if self._cb_cache is None:
-            return np.dot(self[i,n,j], b[j].T.conj())
+            return np.dot(self[i,n,j], self.b_trans(b[j]))
         if (i,n,j) not in self._cb_cache:
-            self._cb_cache[i,n,j] = np.dot(self[i,n,j], b[j].T.conj())
+            self._cb_cache[i,n,j] = np.dot(self[i,n,j], self.b_trans(b[j]))
         return self._cb_cache[i,n,j]
 
     def mc(self, i, n, j, env):
@@ -84,7 +85,7 @@ class C:
         # c[1,n,1] <- None
         binv, t = env['binv'], env['t']
 
-        tmp = np.dot(np.dot(binv.T.conj(), t[n]), binv)
+        tmp = np.dot(np.dot(self.b_trans(binv), t[n]), binv)
 
         self[1,n,1] = tmp
 
@@ -102,7 +103,7 @@ class C:
         tmp -= self.cb(i,n,i-1, env).T.conj()
         tmp -= self.mc(i,n,i, env)
 
-        self[i+1,n,i] = np.dot(binv.T.conj(), tmp)
+        self[i+1,n,i] = np.dot(self.b_trans(binv), tmp)
 
         return self
 
@@ -121,7 +122,7 @@ class C:
         tmp += np.dot(b[i-1], self.cb(i-1,n,i-1, env))
         tmp += np.dot(self.mc(i,n,i, env), self[i,1,i].T.conj())
 
-        self[i+1,n,i+1] = np.dot(np.dot(binv.T.conj(), tmp), binv)
+        self[i+1,n,i+1] = np.dot(np.dot(self.b_trans(binv), tmp), binv)
 
         return self
 
@@ -140,12 +141,21 @@ class C:
 
         b[i], binv = sqrt_and_inv(b2, method=self.b_method, 
                                   shifted_chol=self.shifted_chol, 
-                                  iterate_chol=self.iterate_chol)
+                                  iterate_chol=self.iterate_chol,
+                                  allow_non_psd=self.allow_non_psd)
 
         return b, binv
 
+    def b_trans(self, b):
+        # transpose b[i] or binv
 
-def sqrt_and_inv(x, method='eig', shifted_chol=False, iterate_chol=False):
+        if self.b_method == 'eig':
+            return b
+        else:
+            return b.T.conj()
+
+
+def sqrt_and_inv(x, method='eig', shifted_chol=False, iterate_chol=False, allow_non_psd=False):
     ''' Finds the square root (either via eigenvalues or Cholesky
         decomposition) of x and also returns the inverse of the result.
     '''
@@ -153,7 +163,26 @@ def sqrt_and_inv(x, method='eig', shifted_chol=False, iterate_chol=False):
     eps = np.finfo(x.dtype).eps
 
     if method == 'eig':
-        w, v = np.linalg.eigh(linalg.force_posdef(x, tol=eps*10))
+        #TODO: use shift?
+        if allow_non_psd:
+            x_posdef = x
+            w, v = np.linalg.eigh(x)
+            mask = np.absolute(w) > eps*10
+            w, v = w[mask], v[:,mask]
+            x = np.dot(v*w[None], v.T.conj())
+        else:
+            x_posdef = linalg.force_posdef(x, tol=eps*10)
+
+        w, v = np.linalg.eig(x_posdef)
+
+        if allow_non_psd and np.any(w < 0):
+            w = w.astype(np.complex128)
+
+        # If it's still not positive definite, just ditch eigenvalues:
+        if np.any(w < eps) and not allow_non_psd:
+            mask = w > eps
+            w, v = w[mask], v[:,mask]
+
         bi = np.dot(v * w[None]**0.5, v.T.conj())
         binv = np.dot(v * w[None]**-0.5, v.T.conj())
 
@@ -167,8 +196,8 @@ def sqrt_and_inv(x, method='eig', shifted_chol=False, iterate_chol=False):
         else:
             shift = 0
 
-        chol = lambda x: \
-            np.linalg.cholesky(linalg.force_posdef(x, tol=eps*10)).T.conj()
+        chol = lambda mat: \
+            np.linalg.cholesky(linalg.force_posdef(mat, tol=eps*10)).T.conj()
 
         bi = chol(x + shift)
         binv = np.linalg.inv(bi)
@@ -229,22 +258,33 @@ def kernel(t_occ, t_vir, nmom, debug=False, **kwargs):
         reduced spectral representation.
     '''
 
-    nphys = t_occ[0].shape[0]
+    if t_occ is not None:
+        nphys = t_occ[0].shape[0]
+    if t_vir is not None:
+        nphys = t_vir[0].shape[0]
 
-    m, b = block_lanczos(t_occ, nmom, debug=debug, **kwargs)
-    h_tri = linalg.build_block_tridiagonal(m, b)
+    e = np.empty((0))
+    v = np.empty((nphys, 0))
 
-    e_occ, v_occ = np.linalg.eigh(h_tri[nphys:,nphys:])
-    v_occ = np.dot(b[0].T.conj(), v_occ[:nphys])
+    if t_occ is not None:
+        m, b = block_lanczos(t_occ, nmom, debug=debug, **kwargs)
+        h_tri = linalg.build_block_tridiagonal(m, b)
 
-    m, b = block_lanczos(t_vir, nmom, debug=debug, **kwargs)
-    h_tri = linalg.build_block_tridiagonal(m, b)
+        e_occ, v_occ = np.linalg.eigh(h_tri[nphys:,nphys:])
+        v_occ = np.dot(b[0].T.conj(), v_occ[:nphys])
 
-    e_vir, v_vir = np.linalg.eigh(h_tri[nphys:,nphys:])
-    v_vir = np.dot(b[0].T.conj(), v_vir[:nphys])
+        e = np.concatenate([e, e_occ], axis=0)
+        v = np.concatenate([v, v_occ], axis=1)
 
-    e = np.concatenate([e_occ, e_vir], axis=0)
-    v = np.concatenate([v_occ, v_vir], axis=1)
+    if t_vir is not None:
+        m, b = block_lanczos(t_vir, nmom, debug=debug, **kwargs)
+        h_tri = linalg.build_block_tridiagonal(m, b)
+
+        e_vir, v_vir = np.linalg.eigh(h_tri[nphys:,nphys:])
+        v_vir = np.dot(b[0].T.conj(), v_vir[:nphys])
+
+        e = np.concatenate([e, e_vir], axis=0)
+        v = np.concatenate([v, v_vir], axis=1)
 
     return e, v
 

@@ -101,7 +101,9 @@ def is_posdef(x, tol=0):
         small numbers may be considered zero.
     '''
 
-    return np.all(np.linalg.eigvalsh(x) > tol)
+    w = np.linalg.eigvalsh(x)
+
+    return np.all(w.real > tol) and np.all(w.imag < tol)
 
 
 def force_posdef(x, tol=0, maxiter=1000):
@@ -111,12 +113,9 @@ def force_posdef(x, tol=0, maxiter=1000):
         From https://stackoverflow.com/questions/43238173/python-convert-matrix-to-positive-semi-definite/43244194
     '''
 
-    _, s, v = np.linalg.svd(x)
-    h = np.dot(v.T.conj(), np.dot(np.diag(s), v))
-    xh = (x + h) * 0.5
-
     spacing = np.spacing(np.linalg.norm(x))
     mineig = np.min(np.real(np.linalg.eigvals(x)))
+    xh = x.copy()
     i = np.eye(x.shape[0])
     k = 1
 
@@ -125,6 +124,7 @@ def force_posdef(x, tol=0, maxiter=1000):
         xh += i * (-mineig * k**2 + spacing)
         k += 1
         if k == maxiter:
+            print('maxiter reached in force_posdef')
             break
 
     return xh
@@ -147,6 +147,10 @@ def power(x, n):
     if n == -1: return np.linalg.inv(x)
 
     w, v = np.linalg.eigh(x)
+
+    if np.any(w < 0) and n < 0:
+        w = w.astype(np.complex128)
+
     x_out = np.dot(v * w[None]**n, v.T.conj())
 
     return x_out
