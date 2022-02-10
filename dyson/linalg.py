@@ -3,28 +3,26 @@ Linear algebra tools and extensions to numpy
 '''
 
 import numpy as np
-from dyson import misc
 
 
 def moments(e, v, n, blksize=1024):
-    ''' Get the first n (or within range n) moments of the spectral
-        distribution described by poles e, with transition moments v.
-    '''
+    """Get the first n (or within range n) moments of the spectral
+    distribution described by poles e, with transition moments v.
+    """
 
     squeeze = isinstance(n, int)
     if squeeze:
-        n = [n,]
+        n = [n]
 
     nphys, naux = v.shape
     dtype = np.result_type(e.dtype, v.dtype)
-    
+
     assert e.size == naux
 
     t = np.zeros((len(n), nphys, nphys), dtype=dtype)
 
-    for p0, p1 in misc.prange(0, naux, blksize):
-        en = e[p0:p1][None] ** np.array(n)[:,None]
-        t[p0:p1] = np.einsum('xk,yk,nk->nxy', v, v, en)
+    for i in n:
+        t[i] = np.dot(v * (e**i)[None], v.T.conj())
 
     if squeeze:
         t = t.squeeze()
@@ -33,9 +31,9 @@ def moments(e, v, n, blksize=1024):
 
 
 def build_block_tridiagonal(m, b):
-    ''' Build a block tridiagonal matrix from a list of on- (m) and off-
-        diagonal (b) blocks of matrices.
-    '''
+    """Build a block tridiagonal matrix from a list of on- (m) and off-
+    diagonal (b) blocks of matrices.
+    """
 
     nphys = m[0].shape[0]
     dtype = np.result_type(*([x.dtype for x in m] + [x.dtype for x in b]))
@@ -57,21 +55,20 @@ def build_block_tridiagonal(m, b):
 
 
 def build_spectral_matrix(phys, e, v):
-    ''' Builds a matrix representing the spectral representation with
-        coupling to a physical block.
-    '''
+    """"Builds a matrix representing the spectral representation with
+    coupling to a physical block.
+    """
 
     return np.block([[phys, v], [v.T.conj(), np.diag(e)]])
 
 
 def dot_spectral_matrix(phys, e, v, r, out=None):
-    ''' Dot product of the result of build_spectral_matrix with a 
-        vector r.
-    '''
+    """Dot product of the result of build_spectral_matrix with a
+    vector r.
+    """
 
     nphys = phys.shape[0]
     naux = e.size
-    nqmo = nphys + naux
 
     r = np.asarray(r)
     input_shape = r.shape
@@ -89,7 +86,7 @@ def dot_spectral_matrix(phys, e, v, r, out=None):
     out[sp] += np.dot(v, r[sa])
 
     out[sa]  = np.dot(r[sp].conj().T, v).conj().T
-    out[sa] += e[:,None] * r[sa]
+    out[sa] += e[:, None] * r[sa]
 
     out = out.reshape(input_shape)
 
@@ -97,9 +94,9 @@ def dot_spectral_matrix(phys, e, v, r, out=None):
 
 
 def is_posdef(x, tol=0):
-    ''' Check that a matrix is positive definite, use tol to change how
-        small numbers may be considered zero.
-    '''
+    """Check that a matrix is positive definite, use tol to change how
+    small numbers may be considered zero.
+    """
 
     w = np.linalg.eigvalsh(x)
 
@@ -107,11 +104,11 @@ def is_posdef(x, tol=0):
 
 
 def force_posdef(x, tol=0, maxiter=1000):
-    ''' Iteratively adjust a Hermitian matrix to find the closest positive 
-        definite matrix.
+    """Iteratively adjust a Hermitian matrix to find the closest positive
+    definite matrix.
 
-        From https://stackoverflow.com/questions/43238173/python-convert-matrix-to-positive-semi-definite/43244194
-    '''
+    From https://stackoverflow.com/questions/43238173/python-convert-matrix-to-positive-semi-definite/43244194
+    """
 
     spacing = np.spacing(np.linalg.norm(x))
     mineig = np.min(np.real(np.linalg.eigvals(x)))
@@ -131,15 +128,15 @@ def force_posdef(x, tol=0, maxiter=1000):
 
 
 def hermi_sum(x):
-    ''' x + x^\dagger
-    '''
+    """x + x^\dagger
+    """
 
     return x + x.T.conj().copy()
 
 
 def power(x, n):
-    ''' Raise a matrix x to the power n.
-    '''
+    """Raise a matrix x to the power n.
+    """
 
     if n == 1: return x
     if n == 2: return np.dot(x, x)

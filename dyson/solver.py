@@ -1,8 +1,10 @@
-'''
-Uses the AGF2 solver from PySCF along with user-inputted expressions
+"""Uses the AGF2 solver from PySCF along with user-inputted expressions
 for the occupied and virtual self-energies or Green's functions to
 perform self-consistent calculations.
-'''
+"""
+
+#pragma: noqa
+# Not maintained
 
 import numpy as np
 import time
@@ -100,6 +102,23 @@ def mp2_occupied_se(solver, eri, gf_occ, gf_vir, nmoms, **kwargs):
     t = lib.einsum('xk,yk,nk->nxy', va, vb, e[None]**np.array(nmoms)[:,None])
 
     return t
+
+
+def mp3_occupied_se(solver, eri, gf_occ, gf_vir, nmoms, **kwargs):
+    log = lib.logger.Logger(solver.stdout, solver.verbose)
+
+    t  = MP_term(3, 2, 2, 0.5, 'abru,ruts,tsab,abru,abts') 
+    t += MP_term(3, 4, 2, 0.5, 'adrs,cbad,rscb,adrs,cbrs')
+    t += MP_term(3, 3, 2, 1.0, 'acrt,rbsc,stab,acrt,abst')
+    t += MP_term(3, 3, 2, 1.0, 'bcrt,rasb,stac,bcrt,acst')
+    t += MP_term(3, 3, 3, 1.0, 'acrt,btsc,rsab,acrt,abrs')
+    t += MP_term(3, 3, 1, 1.0, 'cbrt,atsc,rsab,cbrt,abrs')
+    t += MP_term(3, 4, 1, 0.5, 'acrs,dbac,srdb,acrs,dbrs')
+    t += MP_term(3, 2, 1, 0.5, 'abrt,trus,usab,abtr,abus')
+    t += MP_term(3, 3, 1, 1.0, 'bcrt,arbs,tsac,cbrt,acst')
+    t += MP_term(3, 3, 1, 1.0, 'cbrt,rasb,stac,cbrt,acst')
+    t += MP_term(3, 3, 2, 1.0, 'abrs,scat,rtbc,abrs,cbrt')
+    t += MP_term(3, 3, 2, 1.0, 'bcrt,atsc,rsab,bctr,abrs')
 
 
 def adc2_occupied_se(solver, eri, gf_occ, gf_vir, nmoms, **kwargs):

@@ -1,11 +1,10 @@
-'''
-Miscalleneous functions.
-'''
+"""Miscalleneous functions.
+"""
 
 
 def prange(start, stop=None, step=1):
-    ''' Loop over boundaries for blocks in a given range.
-    '''
+    """Loop over boundaries for blocks in a given range.
+    """
 
     if stop is None:
         start, stop = 0, start

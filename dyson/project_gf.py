@@ -1,18 +1,18 @@
-'''
-Projection via the moments of the spectral representation of the
+"""Projection via the moments of the spectral representation of the
 Green's function.
-'''
+"""
 
 import numpy as np
+
 from dyson import misc, linalg
 
 
 def build_projector(phys, e_aux, v_aux, nmom, debug=False, tol=1e-12, blksize=256, chempot=0.0):
-    ''' Builds the vectors which project the auxiliary space into a
-        compressed one with consistency in the separate particle and
-        hole Greens' function moments up to order 2*nmom+1.
-    '''
-    
+    """Builds the vectors which project the auxiliary space into a
+    compressed one with consistency in the separate particle and
+    hole Greens' function moments up to order 2*nmom+1.
+    """
+
     nphys, naux = v_aux.shape
     h = linalg.build_spectral_matrix(phys, e_aux, v_aux)
     w, c = np.linalg.eigh(h)
@@ -23,9 +23,9 @@ def build_projector(phys, e_aux, v_aux, nmom, debug=False, tol=1e-12, blksize=25
         p = np.zeros((naux, nphys, (nmom+2)), dtype=h.dtype)
 
         for p0, p1 in misc.prange(0, np.sum(s), blksize):
-            e0 = w[s][p0:p1][None] ** np.arange(nmom+2)[:,None]
-            c0 = c[:,s][:,p0:p1]
-            p += np.einsum('xi,pi,ni->xpn', c0[nphys:], c0[:nphys], e0)
+            e0 = w[s][p0:p1][None] ** np.arange(nmom+2)[:, None]
+            c0 = c[:, s][:, p0:p1]
+            p += np.einsum('xi,pi,ni->xpn', c0[nphys:], c0[:nphys], e0, optimize=True)
 
         return p.reshape(naux, -1)
 
@@ -47,21 +47,21 @@ def build_projector(phys, e_aux, v_aux, nmom, debug=False, tol=1e-12, blksize=25
 
 
 def kernel(phys, e, v, nmom, debug=False, chempot=0.0, tol=1e-12, blksize=256):
-    ''' Kernel function for the projection method via the moments
-        of the spectral representation of the Green's function.
-        returns the reduced spectral representation.
-    '''
+    """Kernel function for the projection method via the moments
+    of the spectral representation of the Green's function.
+    returns the reduced spectral representation.
+    """
 
     nphys = phys.shape[0]
 
-    p = build_projector(phys, e, v, nmom, debug=debug, chempot=chempot, 
+    p = build_projector(phys, e, v, nmom, debug=debug, chempot=chempot,
                         tol=tol, blksize=blksize)
 
     h = np.dot(p.T.conj(), linalg.dot_spectral_matrix(phys, e, v, p))
     del p
 
-    e, v = np.linalg.eigh(h[nphys:,nphys:])
-    v = np.dot(h[:nphys,nphys:], v)
+    e, v = np.linalg.eigh(h[nphys:, nphys:])
+    v = np.dot(h[:nphys, nphys:], v)
 
     return e, v
 
