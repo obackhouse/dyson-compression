@@ -4,6 +4,7 @@ of the self-energy.
 '''
 
 import numpy as np
+import scipy.linalg
 from dyson import misc, linalg
 
 
@@ -11,7 +12,7 @@ class C:
     ''' Class to contain the recursions.
     '''
 
-    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True, b_method='eig', shifted_chol=True, iterate_chol=True, allow_non_psd=False):
+    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True, allow_non_psd=False, eps=None):
         self._c = {}
         self._cb_cache = {} if cache else None
         self._mc_cache = {} if cache else None
@@ -20,10 +21,8 @@ class C:
         self.eye = np.eye(nphys)
 
         self.force_orthogonality = force_orthogonality
-        self.b_method = b_method
-        self.shifted_chol = shifted_chol
-        self.iterate_chol = iterate_chol
         self.allow_non_psd = allow_non_psd
+        self.eps = None
         self.dtype = dtype
 
     def __getitem__(self, key):
@@ -67,9 +66,9 @@ class C:
         # Get a cached term c[i,n,j] . b[j].T
         b = env['b']
         if self._cb_cache is None:
-            return np.dot(self[i,n,j], self.b_trans(b[j]))
+            return np.dot(self[i,n,j], b[j].T.conj())
         if (i,n,j) not in self._cb_cache:
-            self._cb_cache[i,n,j] = np.dot(self[i,n,j], self.b_trans(b[j]))
+            self._cb_cache[i,n,j] = np.dot(self[i,n,j], b[j].T.conj())
         return self._cb_cache[i,n,j]
 
     def mc(self, i, n, j, env):
@@ -85,7 +84,7 @@ class C:
         # c[1,n,1] <- None
         binv, t = env['binv'], env['t']
 
-        tmp = np.dot(np.dot(self.b_trans(binv), t[n]), binv)
+        tmp = np.dot(np.dot(binv.T.conj(), t[n]), binv)
 
         self[1,n,1] = tmp
 
@@ -103,7 +102,7 @@ class C:
         tmp -= self.cb(i,n,i-1, env).T.conj()
         tmp -= self.mc(i,n,i, env)
 
-        self[i+1,n,i] = np.dot(self.b_trans(binv), tmp)
+        self[i+1,n,i] = np.dot(binv.T.conj(), tmp)
 
         return self
 
@@ -122,7 +121,7 @@ class C:
         tmp += np.dot(b[i-1], self.cb(i-1,n,i-1, env))
         tmp += np.dot(self.mc(i,n,i, env), self[i,1,i].T.conj())
 
-        self[i+1,n,i+1] = np.dot(np.dot(self.b_trans(binv), tmp), binv)
+        self[i+1,n,i+1] = np.dot(np.dot(binv.T.conj(), tmp), binv)
 
         return self
 
@@ -139,78 +138,41 @@ class C:
             if i > 1:
                 b2 += np.dot(b[i-1], b[i-1].T.conj())
 
-        b[i], binv = sqrt_and_inv(b2, method=self.b_method, 
-                                  shifted_chol=self.shifted_chol, 
-                                  iterate_chol=self.iterate_chol,
-                                  allow_non_psd=self.allow_non_psd)
+        b[i], binv = sqrt_and_inv(b2, allow_non_psd=self.allow_non_psd, eps=self.eps)
 
         return b, binv
 
-    def b_trans(self, b):
-        # transpose b[i] or binv
 
-        if self.b_method == 'eig':
-            return b
-        else:
-            return b.T.conj()
-
-
-def sqrt_and_inv(x, method='eig', shifted_chol=False, iterate_chol=False, allow_non_psd=False):
+def sqrt_and_inv(x, allow_non_psd=False, eps=None):
     ''' Finds the square root (either via eigenvalues or Cholesky
         decomposition) of x and also returns the inverse of the result.
     '''
 
-    eps = np.finfo(x.dtype).eps
+    if eps is None:
+        eps = np.finfo(x.dtype).eps
 
-    if method == 'eig':
-        #TODO: use shift?
-        if allow_non_psd:
-            x_posdef = x
-            w, v = np.linalg.eigh(x)
-            mask = np.absolute(w) > eps*10
-            w, v = w[mask], v[:,mask]
-            x = np.dot(v*w[None], v.T.conj())
-        else:
-            x_posdef = linalg.force_posdef(x, tol=eps*10)
+    try:
+        w, v = np.linalg.eigh(x)
+    except np.linalg.LinAlgError:
+        w, v = scipy.linalg.eigh(x)
 
-        w, v = np.linalg.eig(x_posdef)
+    if allow_non_psd:
+        mask = np.abs(w) > eps
+    else:
+        mask = w > eps
 
-        if allow_non_psd and np.any(w < 0):
-            w = w.astype(np.complex128)
+    w, v = w[mask], v[:, mask]
 
-        # If it's still not positive definite, just ditch eigenvalues:
-        if np.any(w < eps) and not allow_non_psd:
-            mask = w > eps
-            w, v = w[mask], v[:,mask]
+    if allow_non_psd and np.any(w < 0):
+        w = w.astype(np.complex128)
 
-        bi = np.dot(v * w[None]**0.5, v.T.conj())
-        binv = np.dot(v * w[None]**-0.5, v.T.conj())
+    # This shouldn't happen but let's check anyway
+    if np.any(w < eps) and not allow_non_psd:
+        mask = w > eps
+        w, v = w[mask], v[:, mask]
 
-    elif method == 'chol':
-        if shifted_chol:
-            # https://arxiv.org/pdf/1809.11085.pdf
-            nphys = x.shape[0]
-            size_fac = (nphys*(nphys+(nphys//2)**3) + nphys*(nphys+1))
-            shift = eps * 11 * np.trace(x) * size_fac
-            shift = shift * np.eye(nphys)
-        else:
-            shift = 0
-
-        chol = lambda mat: \
-            np.linalg.cholesky(linalg.force_posdef(mat, tol=eps*10)).T.conj()
-
-        bi = chol(x + shift)
-        binv = np.linalg.inv(bi)
-
-        if iterate_chol:
-            n = 0
-            x_next = x
-            while np.linalg.cond(x_next) > 10 and n < 100:
-                x_next = np.dot(np.dot(binv.T.conj(), x), binv)
-                b_next = chol(x_next)
-                bi = np.dot(b_next, bi)
-                binv = np.linalg.inv(bi)
-                n += 1
+    bi = np.dot(v * w[None]**0.5, v.T.conj())
+    binv = np.dot(v * w[None]**-0.5, v.T.conj())
 
     return bi, binv
 

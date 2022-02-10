@@ -12,7 +12,7 @@ class C:
     ''' Class to contain the recursions.
     '''
 
-    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True, b_method='eig', shifted_chol=True, iterate_chol=True):
+    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True):
         self._c = {}
 
         self.zero = np.zeros((nphys, nphys))
@@ -20,9 +20,7 @@ class C:
         self[0,0] = self.eye
 
         self.force_orthogonality = force_orthogonality
-        self.b_method = b_method
-        self.shifted_chol = shifted_chol
-        self.iterate_chol = iterate_chol
+        self.eps = None
         self.dtype = dtype
 
     def __getitem__(self, key):
@@ -80,9 +78,7 @@ class C:
         if i > 0:
             b2 -= np.dot(b[i-1], b[i-1].conj().T).conj().T
 
-        b[i], binv = sqrt_and_inv(b2, method=self.b_method,
-                                  shifted_chol=self.shifted_chol,
-                                  iterate_chol=self.iterate_chol)
+        b[i], binv = sqrt_and_inv(b2, eps=self.eps)
 
         return b, binv
 
@@ -136,13 +132,15 @@ def kernel(t_occ, t_vir, nmom, debug=False, **kwargs):
     h_tri = linalg.build_block_tridiagonal(m, b)
 
     e_occ, u_occ = np.linalg.eigh(h_tri)
-    u_occ = np.dot(linalg.power(t_occ[0], 0.5).T.conj(), u_occ[:nphys])
+    b = sqrt_and_inv(t_occ[0], eps=kwargs.get("eps", None))[0]
+    u_occ = np.dot(b.T.conj(), u_occ[:nphys])
 
     m, b = block_lanczos(t_vir, nmom, debug=debug, **kwargs)
     h_tri = linalg.build_block_tridiagonal(m, b)
 
     e_vir, u_vir = np.linalg.eigh(h_tri)
-    u_vir = np.dot(linalg.power(t_vir[0], 0.5).T.conj(), u_vir[:nphys])
+    b = sqrt_and_inv(t_vir[0], eps=kwargs.get("eps", None))[0]
+    u_vir = np.dot(b.T.conj(), u_vir[:nphys])
 
     e = np.concatenate([e_occ, e_vir], axis=0)
     u = np.concatenate([u_occ, u_vir], axis=1).T
