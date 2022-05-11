@@ -1,445 +1,203 @@
-"""Block Lanczos via recursion of the moments of the spectral
-representation of the self-energy.
+"""Block Lanczos for moments of the self-energy.
 """
 
+from collections import defaultdict
 import numpy as np
-import scipy.linalg
+from pyscf import lib
 
-from dyson import linalg
+from dyson import util, Solver, BlockLanczosSymmGF, BlockLanczosNoSymmGF
 
 
-class C:
-    """Class to contain the recursions.
-
-    Arguments
-    ---------
-    nphys: int
-        Number of physical degrees of freedom.
-    force_orthogonality: bool, optional
-        If True, force orthogonality in the vectors composing the
-        recursion terms (default value is True).
-    dtype: numpy.dtype, optional
-        Data-type of the moments (default value is numpy.float64).
-    cache: bool, optional
-        If True, cache terms (default value is True).
-    allow_non_psd: bool, optional
-        Allow non-positively-defined moments (default value is False).
-    eps: bool, optional
-        Tolerance to consider eigenvalues zero (default value is
-        machine precision for the given dtype).
-    """
-
-    def __init__(
-            self, nphys,
-            force_orthogonality=True,
-            dtype=np.float64,
-            cache=True,
-            allow_non_psd=False,
-            eps=None,
-    ):
-        self._c = {}
-        self._cb_cache = {} if cache else None
-        self._mc_cache = {} if cache else None
-
-        self.zero = np.zeros((nphys, nphys))
-        self.eye = np.eye(nphys)
-
-        self.force_orthogonality = force_orthogonality
-        self.allow_non_psd = allow_non_psd
-        self.eps = None
-        self.dtype = dtype
-
+class V:
+    def __init__(self, zero, symmetry=True):
+        self.symmetry = symmetry
+        self.zero = zero
+        self.data = {}
 
     def __getitem__(self, key):
-        """Get a recursion term.
-
-        Arguments
-        ---------
-        key: tuple of int (3)
-            Indices (i,n,j) of term to return.
-
-        Returns
-        -------
-        term: numpy.ndarray (nphys, nphys)
-            (i,n,j)th recursion term.
-        """
-
         i, n, j = key
         if i == 0 or j == 0:
             return self.zero
-        elif i < j:
-            return self[j, n, i].T.conj()
+        elif (not self.symmetry) or i >= j:
+            return self.data[i, n, j]
         else:
-            return self._c[key]
-
+            return self[j, n, i].T.conj()
 
     def __setitem__(self, key, val):
-        """Set a recursion term.
-
-        Arguments
-        ---------
-        key: tuple of int (3)
-            Order, index of the term to set.
-            Indices (i,n,j) of term to return.
-        val: numpy.ndarray (nphys, nphys)
-            (i,n,j)th recursion term.
-        """
-
         i, n, j = key
-        if i < j:
-            self[j, n, i] = val.T.conj()
+        if (not self.symmetry) or i >= j:
+            self.data[i, n, j] = val
         else:
-            self._c[key] = val
+            self.data[j, n, i] = val.T.conj()
 
 
-    def check_sanity(self):
-        """Check the sanity of the recursion terms.
+class BlockLanczosSymmSE(BlockLanczosSymmGF):
+    """Block Lanczos for Hermitian moments of the self-energy.
+
+    Input
+    -----
+        h_phys: ndarray (n, n)
+            Effective single-particle Hamiltonian in the physical
+            space, i.e. the Fock matrix.
+        moments: ndarray (m, n, n)
+            Moments of the self-energy with which one wishes to
+            produce a consistent set of Green's function poles to.
+
+    Options
+    -------
+        eig_tol: float
+            Threshold for eigenvalues to be considered zero for singular
+            matrices (default value is 1e-14).
+
+    Output
+    ------
+        e: ndarray (k,)
+            Energy of the Green's function poles.
+        v: ndarray (n, k)
+            Coupling of the Green's function poles.
+    """
+
+    def __init__(self, h_phys, moments, **kwargs):
+        self.eig_tol = 1e-14
+
+        h_phys = np.asarray(h_phys)
+        moments = np.asarray(moments)
+        assert h_phys.shape == moments.shape[1:]
+        assert np.allclose(h_phys, h_phys.T.conj())
+        assert np.allclose(moments, moments.swapaxes(1, 2).conj())
+
+        Solver.__init__(self, h_phys, moments, **kwargs)
+
+    def get_blocks(self):
+        """Get on- and off-diagonal blocks of the block tridiagonalised
+        Hamiltonian.
         """
 
-        for (i, n, j), c in self._c.items():
-            if i == j:
-                # Check Hermiticity
-                if not np.allclose(c, c.T.conj(), rtol=1e-6, atol=1e-4):
-                    raise ValueError('\nSanity check failed for C^{%d}_{%d,%d}' % (n, i, j))
+        α = np.zeros((self.niter+1, self.norb, self.norb), dtype=self.dtype)
+        β = np.zeros((self.niter, self.norb, self.norb), dtype=self.dtype)
 
-            if i == 0 or j == 0:
-                # Zeroth iteration Lanczos vector is zero
-                if not np.allclose(c, self.zero):
-                    raise ValueError('\nSanity check failed for C^{%d}_{%d,%d}' % (n, i, j))
+        v = V(self.zero)
 
-            elif n == 0 and i == j:
-                # Globally orthogonal Lanczos vectors for i==j
-                if not np.allclose(c, self.eye):
-                    raise ValueError('\nSanity check failed for C^{%d}_{%d,%d}' % (n, i, j))
+        βsq = self.moments[0]
+        β[0] = self.mat_sqrt(βsq)
+        βinv = self.mat_isqrt(βsq)
+        for i in range(self.nmom):
+            v[1, i, 1] = np.linalg.multi_dot((
+                βinv.T.conj(),
+                self.moments[i],
+                βinv,
+            ))
 
-            elif n == 0 and i != j:
-                # Globally orthogonal Lanczos vectors for i!=j
-                if not np.allclose(c, self.zero):
-                    raise ValueError('\nSanity check failed for C^{%d}_{%d,%d}' % (n, i, j))
+        def vb(i, n, j):
+            return np.dot(v[i, n, j], β[j].T.conj())
 
+        def av(i, n, j):
+            return np.dot(v[i, 1, i], v[i, n, j])
 
-    def cb(self, i, n, j, env):
-        """Get a cached term c[i,n,j] . b[j].T
+        for i in range(1, self.niter):
+            βsq = (
+                + v[i, 2, i]
+                - lib.hermi_sum(vb(i, 1, i-1))
+                - np.dot(v[i, 1, i], v[i, 1, i].T.conj())
+            )
 
-        Arguments
-        ---------
-        i: int
-            First index of recursion term.
-        n: int
-            Second index of recursion term.
-        j: int
-            Third index of recursion term.
-        env: dict
-            Dictionary containing b.
-
-        Returns
-        -------
-        cb: numpy.ndarray (nphys, nphys)
-            The product of the (i,n,j)th recursion term and the jth B
-            term.
-        """
-
-        b = env['b']
-
-        if self._cb_cache is None:
-            return np.dot(self[i, n, j], b[j].T.conj())
-
-        if (i, n, j) not in self._cb_cache:
-            self._cb_cache[i, n, j] = np.dot(self[i, n, j], b[j].T.conj())
-
-        return self._cb_cache[i, n, j]
-
-
-    def mc(self, i, n, j, env):
-        """Get a cached term c[i,1,i] . c[i,n,j]
-
-        Arguments
-        ---------
-        i: int
-            First index of recursion term.
-        n: int
-            Second index of recursion term.
-        j: int
-            Third index of recursion term.
-        env: dict
-            Dictionary containing m.
-
-        Returns
-        -------
-        mc: numpy.ndarray (nphys, nphys)
-            The product of the (i,1,i)th recursion term and the
-            (i,n,j)th recursion terms.
-        """
-
-        if self._mc_cache is None:
-            return np.dot(self[i, 1, i], self[i, n, j])
-
-        if (i, n, j) not in self._mc_cache:
-            self._mc_cache[i, n, j] = np.dot(self[i, 1, i], self[i, n, j])
-
-        return self._mc_cache[i, n, j]
-
-
-    def build_initial(self, n, env):
-        """Build the orthogonalised moments.
-
-        Arguments
-        ---------
-        n: int
-            Order of moment to orthogonalise.
-        env: dict
-            Dictionary containing binv, t.
-        """
-
-        binv, t = env['binv'], env['t']
-
-        self[1, n, 1] = np.linalg.multi_dot((binv.T.conj(), t[n], binv))
-
-        return self
-
-
-    def bump_single(self, i, n, env):
-        """Compute the (i+1,n,i)th recursion term.
-
-        Arguments
-        ---------
-        i: int
-            First index of recursion term.
-        n: int
-            Second index of recursion term.
-        env: dict
-            Dictionary containing b, binv.
-        """
-
-        binv = env['binv']
-
-        if n == 0 and self.force_orthogonality:
-            self[i+1, n, i] = self.zero.copy()
-            return self
-
-        tmp  = self[i, n+1, i].copy()
-        tmp -= self.cb(i, n, i-1, env).T.conj()
-        tmp -= self.mc(i, n, i, env)
-
-        self[i+1, n, i] = np.dot(binv.T.conj(), tmp)
-
-        return self
-
-
-    def bump_both(self, i, n, env):
-        """Compute the (i+1,n,i+1)th recursion term.
-
-        Arguments
-        ---------
-        i: int
-            First index of recursion term.
-        n: int
-            Second index of recursion term.
-        env: dict
-            Dictionary containing b, binv.
-        """
-
-        b, binv = env['b'], env['binv']
-
-        if n == 0 and self.force_orthogonality:
-            self[i+1, n, i+1] = self.eye.copy()
-            return self
-
-        tmp  = self[i, n+2, i].copy()
-        tmp -= linalg.hermi_sum(self.cb(i, n+1, i-1, env))
-        tmp -= linalg.hermi_sum(self.mc(i, n+1, i, env))
-        tmp += linalg.hermi_sum(np.dot(self[i, 1, i], self.cb(i, n, i-1, env)))
-        tmp += np.dot(b[i-1], self.cb(i-1, n, i-1, env))
-        tmp += np.dot(self.mc(i, n, i, env), self[i, 1, i].T.conj())
-
-        self[i+1, n, i+1] = np.linalg.multi_dot((binv.T.conj(), tmp, binv))
-
-        return self
-
-    def compute_b(self, i, env):
-        """Compute the ith B term, returning also its inverse.
-
-        Arguments
-        ---------
-        i: int
-            Index of term.
-        env: dict
-            Dictionary containing b, t.
-
-        Returns
-        -------
-        b: numpy.ndarray (n, nphys, nphys)
-            B matrix with the ith term set.
-        binv: numpy.ndarray (nphys, nphys)
-            Inverse of the ith B term.
-        """
-
-        b, t = env['b'], env['t']
-
-        if i == 0:
-            b2 = t[0]
-        else:
-            b2  = self[i, 2, i].copy()
-            b2 -= linalg.hermi_sum(self.cb(i, 1, i-1, env))
-            b2 -= np.dot(self[i, 1, i], self[i, 1, i].T.conj())
             if i > 1:
-                b2 += np.dot(b[i-1], b[i-1].T.conj())
+                βsq += np.dot(β[i-1], β[i-1].T.conj())
 
-        b[i], binv = sqrt_and_inv(b2, allow_non_psd=self.allow_non_psd, eps=self.eps)
+            β[i] = self.mat_sqrt(βsq)
+            βinv = self.mat_isqrt(βsq)
 
-        return b, binv
+            for n in range(2 * (self.niter-i)):
+                if n != (2 * (self.niter-i) - 1):
+                    r = (
+                        + v[i, n+1, i]
+                        - vb(i, n, i-1).T.conj()
+                        - av(i, n, i)
+                    )
+                    v[i+1, n, i] = np.dot(βinv.T.conj(), r)
 
+                r = (
+                    + v[i, n+2, i]
+                    - lib.hermi_sum(vb(i, n+1, i-1))
+                    - lib.hermi_sum(av(i, n+1, i))
+                    + lib.hermi_sum(np.dot(v[i, 1, i], vb(i, n, i-1)))
+                    + np.dot(β[i-1], vb(i-1, n, i-1))
+                    + np.dot(av(i, n, i), v[i, 1, i].T.conj())
+                )
+                v[i+1, n, i+1] = np.linalg.multi_dot((βinv.T.conj(), r, βinv))
 
-def sqrt_and_inv(x, allow_non_psd=False, eps=None):
-    """Returns a matrix raised to the power 1/2 and -1/2.
+        for i in range(self.niter+1):
+            α[i] = v[i, 1, i]
 
-    Arguments
-    ---------
-    x: ndarray
-        Matrix to decompose.
-    allow_non_psd: bool, optional
-        If True, allow matrix to be non-positively-defined (default
-        value is False).
-    eps: float, optional
-        Tolerance to consider an eigenvalue zero (default value is
-        machine precision for the given dtype).
-    """
+        return α, β
 
-    if eps is None:
-        eps = np.finfo(x.dtype).eps
+    def get_auxiliaries(self):
+        α, β = self.get_blocks()
+        orth = β[0].T.conj()
+        h_tri = self.build_block_tridiagonal(α, β)
 
-    try:
-        w, v = np.linalg.eigh(x)
-    except np.linalg.LinAlgError:
-        w, v = scipy.linalg.eigh(x)
+        e, u = np.linalg.eigh(h_tri[self.norb:, self.norb:])
+        u = np.dot(orth, u[:self.norb])
 
-    if allow_non_psd:
-        mask = np.abs(w) > eps
-    else:
-        mask = w > eps
+        return e, u
 
-    w, v = w[mask], v[:, mask]
+    def kernel(self):
+        e, u = self.get_auxiliaries()
+        h_aux = np.block([
+            [self.h_phys, u],
+            [u.T.conj(),  np.diag(e)],
+        ])
 
-    if allow_non_psd and np.any(w < 0):
-        w = w.astype(np.complex128)
+        e, v = np.linalg.eigh(h_aux)
+        v = v[:self.norb]
 
-    # This shouldn't happen but let's check anyway
-    if np.any(w < eps) and not allow_non_psd:
-        mask = w > eps
-        w, v = w[mask], v[:, mask]
+        for i in range(min(5, len(e))):
+            self.log.info(" %s: %s", i, util.format_value(e[i]))
+        self.log.info(" ...")
 
-    bi = np.dot(v * w[None]**0.5, v.T.conj())
-    binv = np.dot(v * w[None]**-0.5, v.T.conj())
+        return e, v
 
-    return bi, binv
+    @property
+    def h_phys(self):
+        return self.inp[0]
 
+    @property
+    def moments(self):
+        return self.inp[1]
 
-def block_lanczos(t, nmom, debug=False, **kwargs):
-    """Block Lanczos algorithm using recursion of the moments of the
-    spectral representation of the self-energy. Performs nmom+1
-    iterations of the block Lanczos algorithm. Input moments must
-    index the first 2*nmom+2 moments.
-
-    Arguments
-    ---------
-    t: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments to which consistency is achieved.
-    nmom: int
-        Number of iterations of block Lanczos to perform.
-
-    Other kwargs are passed to the C object.
-
-    Returns
-    -------
-    m: numpy.ndarray (nmom+1, nphys, nphys)
-        On-diagonal blocks of the block tridiagonalised matrix.
-    b: numpy.ndarray (nmom, nphys, nphys)
-        Off-diagonal blocks of the block tridiagonalised matrix.
-    """
-
-    nphys = t[0].shape[0]
-    dtype = t[0].dtype
-    nblock = nmom+1
-
-    m = np.zeros((nblock+1, nphys, nphys), dtype=dtype)
-    b = np.zeros((nblock,   nphys, nphys), dtype=dtype)
-    c = C(nphys, dtype=dtype, **kwargs)
-
-    b, binv = c.compute_b(0, locals())
-
-    for i in range(2*nmom+2):
-        c = c.build_initial(i, locals())
-
-    for i in range(1, nblock):
-        b, binv = c.compute_b(i, locals())
-
-        for n in range(2*(nblock-i)-1):
-            c = c.bump_single(i, n, locals())
-            c = c.bump_both(i, n, locals())
-        c = c.bump_both(i, n+1, locals())
-
-    if debug:
-        c.check_sanity()
-
-    for i in range(nblock+1):
-        m[i] = c[i, 1, i]
-
-    return m, b
+    @property
+    def niter(self):
+        return (self.nmom - 2) // 2 + 1
 
 
-def kernel(t_occ, t_vir, nmom, debug=False, **kwargs):
-    """Kernel function for the block Lanczos method via the moments
-    of the spectral representation of the self-energy.
 
-    Arguments
-    ---------
-    t_occ: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments of the occupied self-energy.
-    t_vir: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments of the virtual self-energy.
-    nmom: int
-        Number of iterations of block Lanczos to perform.
+if __name__ == "__main__":
+    np.set_printoptions(edgeitems=100, linewidth=1000, precision=4)
 
-    Other kwargs are passed to the C object.
+    nmom = 4
+    norb = 5
+    naux = 100
 
-    Returns
-    -------
-    e: numpy.ndarray
-        Energies of the compressed self-energy auxiliaries.
-    v: numpy.ndarray
-        Coupling of the compressed self-energy auxiliaries.
-    """
+    f = np.diag(np.random.random((norb,)))
+    e_aux = np.random.random((naux,)) * 5.0
+    v_aux = np.random.random((norb, naux)) - 0.5
+    m1 = np.einsum("xk,yk,nk->nxy", v_aux, v_aux.conj(), e_aux[None]**np.arange(nmom)[:, None])
+    solver = BlockLanczosSymmSE(f, m1)
+    e_aux, v_aux = solver.get_auxiliaries()
+    m2 = np.einsum("xk,yk,nk->nxy", v_aux, v_aux.conj(), e_aux[None]**np.arange(nmom)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)
 
-    if t_occ is not None:
-        nphys = t_occ[0].shape[0]
-    if t_vir is not None:
-        nphys = t_vir[0].shape[0]
-
-    e = np.empty((0))
-    v = np.empty((nphys, 0))
-
-    if t_occ is not None:
-        m, b = block_lanczos(t_occ, nmom, debug=debug, **kwargs)
-        h_tri = linalg.build_block_tridiagonal(m, b)
-
-        e_occ, v_occ = np.linalg.eigh(h_tri[nphys:, nphys:])
-        v_occ = np.dot(b[0].T.conj(), v_occ[:nphys])
-
-        e = np.concatenate([e, e_occ], axis=0)
-        v = np.concatenate([v, v_occ], axis=1)
-
-    if t_vir is not None:
-        m, b = block_lanczos(t_vir, nmom, debug=debug, **kwargs)
-        h_tri = linalg.build_block_tridiagonal(m, b)
-
-        e_vir, v_vir = np.linalg.eigh(h_tri[nphys:, nphys:])
-        v_vir = np.dot(b[0].T.conj(), v_vir[:nphys])
-
-        e = np.concatenate([e, e_vir], axis=0)
-        v = np.concatenate([v, v_vir], axis=1)
-
-    return e, v
-
-
-if __name__ == '__main__':
-    pass
+    f = np.diag(np.random.random((norb,)))
+    e_aux = np.random.random((naux,)) * 5.0
+    v_aux = np.random.random((norb, naux)) - 0.5 + (np.random.random((norb, naux)) - 0.5) * 1.0j
+    m1 = np.einsum("xk,yk,nk->nxy", v_aux, v_aux.conj(), e_aux[None]**np.arange(nmom)[:, None])
+    solver = BlockLanczosSymmSE(f, m1)
+    e_aux, v_aux = solver.get_auxiliaries()
+    m2 = np.einsum("xk,yk,nk->nxy", v_aux, v_aux.conj(), e_aux[None]**np.arange(nmom)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)

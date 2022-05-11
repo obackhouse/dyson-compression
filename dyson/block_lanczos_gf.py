@@ -1,304 +1,448 @@
-"""Block Lanczos via recursion of the moments of the spectral
-representation of the Green's function.
+"""Block Lanczos for moments of the Green's function.
 """
+# TODO caching
 
+from collections import defaultdict
 import numpy as np
 
-from dyson import linalg
-from dyson.block_lanczos_se import sqrt_and_inv
+from dyson import util, Solver
 
 
-class C:
-    """Class to contain the recursions.
+def BlockLanczosGF(moments, **kwargs):
+    moments = np.asarray(moments)
+    if np.allclose(moments, moments.swapaxes(1, 2).conj()):
+        return BlockLanczosSymmGF(moments, **kwargs)
+    else:
+        return BlockLanczosNoSymmGF(moments, **kwargs)
 
-    Arguments
-    ---------
-    nphys: int
-        Number of physical degrees of freedom.
-    force_orthogonality: bool, optional
-        If True, force orthogonality in the vectors composing the
-        recursion terms (default value is True).
-    dtype: numpy.dtype, optional
-        Data-type of the moments (default value is numpy.float64).
-    cache: bool, optional
-        If True, cache terms (default value is True).
+
+class BlockLanczosSymmGF(Solver):
+    """Block Lanczos for Hermitian moments of the Green's function.
+
+    Input
+    -----
+        moments: ndarray (m, n, n)
+            Moments of the Green's function with which one wishes to
+            produce a consistent set of Green's function poles to.
+
+    Options
+    -------
+        eig_tol: float
+            Threshold for eigenvalues to be considered zero for singular
+            matrices (default value is 1e-14).
+
+    Output
+    ------
+        e: ndarray (k, )
+            Energy of the Green's function poles.
+        v: ndarray (n, k)
+            Coupling of the Green's function poles to each orbital.
     """
 
-    def __init__(self, nphys, force_orthogonality=True, dtype=np.float64, cache=True):
-        self._c = {}
+    def __init__(self, moments, **kwargs):
+        self.eig_tol = 1e-14
 
-        self.zero = np.zeros((nphys, nphys))
-        self.eye = np.eye(nphys)
-        self[0, 0] = self.eye
+        moments = np.asarray(moments)
+        assert np.allclose(moments, moments.swapaxes(1, 2).conj())
 
-        self.force_orthogonality = force_orthogonality
-        self.eps = None
-        self.dtype = dtype
+        Solver.__init__(self, moments, **kwargs)
 
-
-    def __getitem__(self, key):
-        """Get a recursion term.
-
-        Arguments
-        ---------
-        key: tuple of int (2)
-            Indices (i,j) of term to return.
-
-        Returns
-        -------
-        term: numpy.ndarray (nphys, nphys)
-            (i,j)th recursion term.
+    def mat_sqrt(self, array):
+        """Return the square-root of a matrix.
         """
 
-        n, i = key
-        if i < 0 or i > n or n < 0:
-            return self.zero
+        w, v = np.linalg.eigh(array)
+
+        if self.real:
+            mask = np.abs(w) >= 0.0
+            w, v = w[mask], v[:, mask]
+            fac = 0.5
         else:
-            return self._c[n, i]
+            fac = 0.5 + 0j
 
+        return np.dot(v * w[None]**fac, v.T.conj())
 
-    def __setitem__(self, key, val):
-        """Set a recursion term.
-
-        Arguments
-        ---------
-        key: tuple of int (2)
-            Order, index of the term to set.
-            Indices (i,j) of term to return.
-        val: numpy.ndarray (nphys, nphys)
-            (i,j)th recursion term.
+    def mat_isqrt(self, array):
+        """Return the inverse square-root of a matrix.
         """
 
-        n, i = key
-        self._c[n, i] = val
+        w, v = np.linalg.eigh(array)
 
+        if self.real:
+            mask = w > self.eig_tol
+            fac = -0.5
+        else:
+            mask = np.abs(w) > self.eig_tol
+            fac = -0.5 + 0j
 
-    def check_sanity(self):
-        """Check the sanity of the recursion terms.
+        w, v = w[mask], v[:, mask]
+
+        return np.dot(v * w[None]**fac, v.T.conj())
+
+    def get_blocks(self):
+        """Get on- and off-diagonal blocks of the block tridiagonalised
+        Hamiltonian.
         """
 
-        pass  # TODO
+        α = np.zeros((self.niter+1, self.norb, self.norb), dtype=self.dtype)
+        β = np.zeros((self.niter, self.norb, self.norb), dtype=self.dtype)
+        t = np.zeros((self.nmom, self.norb, self.norb), dtype=self.dtype)
+
+        v = defaultdict(lambda: self.zero)
+        v[0, 0] = np.eye(self.norb).astype(self.dtype)
+
+        orth = self.mat_isqrt(self.moments[0])
+        for i in range(self.nmom):
+            t[i] = np.linalg.multi_dot((
+                orth,
+                self.moments[i],
+                orth,
+            ))
+
+        α[0] = t[1]
+
+        for i in range(self.niter):
+            βsq = self.zero
+            for j in range(i+2):
+                for l in range(i+1):
+                    βsq += np.linalg.multi_dot((
+                        v[i, l].T.conj(),
+                        t[j+l+1],
+                        v[i, j-1],
+                    ))
+
+            βsq -= np.dot(α[i], α[i])
+            if i:
+                βsq -= np.dot(β[i-1], β[i-1])
+
+            β[i] = self.mat_sqrt(βsq)
+            βinv = self.mat_isqrt(βsq)
+
+            for j in range(i+2):
+                r = (
+                        + v[i, j-1]
+                        - np.dot(v[i, j], α[i])
+                        - np.dot(v[i-1, j], β[i-1])
+                )
+                v[i+1, j] = np.dot(r, βinv)
+
+            for j in range(i+2):
+                for l in range(i+2):
+                    α[i+1] += np.linalg.multi_dot((
+                        v[i+1, l].T.conj(),
+                        t[j+l+1],
+                        v[i+1, j],
+                    ))
+
+        return α, β
+
+    def build_block_tridiagonal(self, α, β):
+        h = np.block([[
+            α[i] if i == j else
+            β[j] if j == i-1 else
+            β[i].T.conj() if i == j-1 else self.zero
+            for j in range(len(α))]
+            for i in range(len(α))]
+        )
+
+        return h
+
+    def kernel(self):
+        α, β = self.get_blocks()
+        orth = self.mat_sqrt(self.moments[0])
+        h_tri = self.build_block_tridiagonal(α, β)
+
+        e, u = np.linalg.eigh(h_tri)
+        u = np.dot(orth, u[:self.norb])
+
+        for i in range(min(5, len(e))):
+            self.log.info(" %s: %s", i, util.format_value(e[i]))
+        self.log.info(" ...")
+
+        return e, u
+
+    def preamble(self):
+        self.log.info("shape: %s", repr((self.norb, self.norb)))
+        self.log.info("dtype: %s", self.dtype)
+        self.log.info("niter: %s", self.niter)
+        self.log.info("nmom: %s", self.nmom)
+        self.log.info("eig_tol: %s", self.eig_tol)
+
+    @property
+    def moments(self):
+        return self.inp[0]
+
+    @property
+    def norb(self):
+        return self.moments.shape[-1]
+
+    @property
+    def nmom(self):
+        return self.moments.shape[0]
+
+    @property
+    def niter(self):
+        return (self.nmom - 2) // 2
+
+    @property
+    def dtype(self):
+        return self.moments.dtype
+
+    @property
+    def complex(self):
+        return np.iscomplexobj(self.dtype)
+
+    @property
+    def real(self):
+        return not self.complex
+
+    @property
+    def zero(self):
+        return np.zeros((self.norb, self.norb), dtype=self.dtype)
 
 
-    def build_initial(self, n, env):
-        """Build the orthogonalised moments.
+class BlockLanczosNoSymmGF(BlockLanczosSymmGF):
+    """Block Lanczos for non-Hermitian moments of the Green's function.
 
-        Arguments
-        ---------
-        n: int
-            Order of moment to orthogonalise.
-        env: dict
-            Dictionary containing orth, t, s.
+    Input
+    -----
+        moments: ndarray (m, n, n)
+            Moments of the Green's function with which one wishes to
+            produce a consistent set of Green's function poles to.
 
-        Returns
-        -------
-        s: numpy.ndarray (nphys, nphys)
-            Orthogonalised moments with nth term set.
-        """
-
-        orth, t, s = env['orth'], env['t'], env['s']
-
-        s[n] = np.linalg.multi_dot((orth, t[n], orth))
-
-        return s
-
-
-    def bump_single(self, i, j, env):
-        """Compute the (i+1,j)th recursion term.
-
-        Arguments
-        ---------
-        i: int
-            First index of recursion term.
-        j: int
-            Second index of recursion term.
-        env: dict
-            Dictionary containing m, b, binv.
-        """
-
-        m, b, binv = env['m'], env['b'], env['binv']
-
-        tmp  = self[i, j-1].copy()
-        tmp -= np.dot(self[i, j], m[i])
-        tmp -= np.dot(self[i-1, j], b[i-1].conj().T)
-
-        self[i+1, j] = np.dot(tmp, binv)
-
-        return self
-
-    def compute_m(self, i, env):
-        """Compute the (i+1)th M term.
-
-        Arguments
-        ---------
-        i: int
-            Index of term.
-        env: dict
-            Dictionary containing m, s.
-
-        Returns
-        -------
-        m: numpy.ndarray (n, nphys, nphys)
-            M matrix with the (i+1)th term set.
-        """
-
-        m, s = env['m'], env['s']
-
-        for j in range(i+2):
-            for l in range(i+2):
-                m[i+1] += np.linalg.multi_dot((self[i+1, l].conj().T, s[j+l+1], self[i+1, j]))
-
-        return m
-
-    def compute_b(self, i, env):
-        """Compute the ith B term, returning also its inverse.
-
-        Arguments
-        ---------
-        i: int
-            Index of term.
-        env: dict
-            Dictionary containing m, b, s.
-
-        Returns
-        -------
-        b: numpy.ndarray (n, nphys, nphys)
-            B matrix with the ith term set.
-        binv: numpy.ndarray (nphys, nphys)
-            Inverse of the ith B term.
-        """
-
-        m, b, s = env['m'], env['b'], env['s']
-
-        b2 = self.zero.copy()
-        for j in range(i+2):
-            for l in range(i+1):
-                b2 += np.linalg.multi_dot((self[i, l].T.conj(), s[j+l+1], self[i, j-1]))
-
-        b2 -= np.dot(m[i], m[i].T.conj())
-        if i > 0:
-            b2 -= np.dot(b[i-1], b[i-1].conj().T).conj().T
-
-        b[i], binv = sqrt_and_inv(b2, eps=self.eps)
-
-        return b, binv
-
-
-def block_lanczos(t, nmom, debug=False, **kwargs):
-    """Block Lanczos algorithm using recursion of the moments of the
-    spectral representation of the Green's function. Performs nmom+1
-    iterations of the block Lanczos algorithm. Input moments must
-    index the first 2*nmom+2 moments.
-
-    Arguments
-    ---------
-    t: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments to which consistency is achieved.
-    nmom: int
-        Number of iterations of block Lanczos to perform.
-
-    Other kwargs are passed to the C object.
-
-    Returns
+    Options
     -------
-    m: numpy.ndarray (nmom+1, nphys, nphys)
-        On-diagonal blocks of the block tridiagonalised matrix.
-    b: numpy.ndarray (nmom, nphys, nphys)
-        Off-diagonal blocks of the block tridiagonalised matrix.
+        eig_tol: float
+            Threshold for eigenvalues to be considered zero for singular
+            matrices (default value is 1e-14).
+
+    Output
+    ------
+        e: ndarray (k, )
+            Energy of the Green's function poles.
+        v: ndarray (n, k)
+            Left-hand coupling of the Green's function poles to each
+            orbital.
+        u: ndarray (n, k)
+            Right-hand coupling of the Green's function poles to each
+            orbital.
     """
 
-    nphys = t[0].shape[0]
-    dtype = t[0].dtype
-    nblock = 2*nmom+1
+    def __init__(self, moments, **kwargs):
+        self.eig_tol = 1e-14
 
-    m = np.zeros((nmom+1, nphys, nphys), dtype=dtype)
-    b = np.zeros((nmom,   nphys, nphys), dtype=dtype)
-    s = np.zeros_like(t)
-    c = C(nphys, dtype=dtype, **kwargs)
+        moments = np.asarray(moments)
 
-    orth = linalg.power(t[0], -0.5)
+        Solver.__init__(self, moments, **kwargs)
 
-    for i in range(len(t)):
-        s = c.build_initial(i, locals())
+    def mat_sqrt(self, array):
+        """Return the square-root of a matrix.
+        """
 
-    m[0] = s[1]
+        w, vl = np.linalg.eig(array)
+        vr = np.linalg.inv(vl)
 
-    for i in range(nmom):
-        b, binv = c.compute_b(i, locals())
+        return np.dot(vl * w[None]**(0.5+0j), vr)
 
-        for j in range(i+2):
-            c = c.bump_single(i, j, locals())
+    def mat_isqrt(self, array):
+        """Return the inverse square-root of a matrix.
+        """
 
-        m = c.compute_m(i, locals())
+        w, v = np.linalg.eig(array)
 
-    if debug:
-        c.check_sanity()
+        mask = np.abs(w) > self.eig_tol
+        w = w[mask]
+        vl = v[:, mask]
+        vr = np.linalg.inv(v)[mask]
 
-    return m, b
+        return np.dot(vl * w[None]**(-0.5+0j), vr)
+
+    def get_blocks(self):
+        """Get on- and off-diagonal blocks of the block tridiagonalised
+        Hamiltonian.
+        """
+
+        α = np.zeros((self.niter+1, self.norb, self.norb), dtype=self.dtype)
+        β = np.zeros((self.niter, self.norb, self.norb), dtype=self.dtype)
+        γ = np.zeros((self.niter, self.norb, self.norb), dtype=self.dtype)
+        t = np.zeros((self.nmom, self.norb, self.norb), dtype=self.dtype)
+
+        v = defaultdict(lambda: self.zero)
+        w = defaultdict(lambda: self.zero)
+        v[0, 0] = np.eye(self.norb).astype(self.dtype)
+        w[0, 0] = np.eye(self.norb).astype(self.dtype)
+
+        orth = self.mat_isqrt(self.moments[0])
+        for i in range(self.nmom):
+            t[i] = np.linalg.multi_dot((
+                orth,
+                self.moments[i],
+                orth,
+            ))
+
+        α[0] = t[1]
+
+        for i in range(self.niter):
+            βsq = self.zero
+            γsq = self.zero
+            for j in range(i+2):
+                for l in range(i+1):
+                    βsq += np.linalg.multi_dot((
+                        w[i, l],
+                        t[j+l+1],
+                        v[i, j-1],
+                    ))
+                    γsq += np.linalg.multi_dot((
+                        w[i, j-1],
+                        t[j+l+1],
+                        v[i, l],
+                    ))
+
+            βsq -= np.dot(α[i], α[i])
+            γsq -= np.dot(α[i], α[i])
+            if i:
+                βsq -= np.dot(γ[i-1], γ[i-1])
+                γsq -= np.dot(β[i-1], β[i-1])
+
+            β[i] = self.mat_sqrt(βsq)
+            γ[i] = self.mat_sqrt(γsq)
+            βinv = self.mat_isqrt(βsq)
+            γinv = self.mat_isqrt(γsq)
+
+            for j in range(i+2):
+                r = (
+                        + v[i, j-1]
+                        - np.dot(v[i, j], α[i])
+                        - np.dot(v[i-1, j], β[i-1])
+                )
+                v[i+1, j] = np.dot(r, γinv)
+
+                s = (
+                        + w[i, j-1]
+                        - np.dot(α[i], w[i, j])
+                        - np.dot(γ[i-1], w[i-1, j])
+                )
+                w[i+1, j] = np.dot(βinv, s)
+
+            for j in range(i+2):
+                for l in range(i+2):
+                    α[i+1] += np.linalg.multi_dot((
+                        w[i+1, l],
+                        t[j+l+1],
+                        v[i+1, j],
+                    ))
+
+        return α, β, γ
+
+    def build_block_tridiagonal(self, α, β, γ):
+        h = np.block([[
+            α[i] if i == j else
+            β[j] if j == i-1 else
+            γ[i] if i == j-1 else self.zero
+            for j in range(len(α))]
+            for i in range(len(α))]
+        )
+
+        return h
+
+    def kernel(self):
+        α, β, γ = self.get_blocks()
+        orth = self.mat_sqrt(self.moments[0])
+        h_tri = self.build_block_tridiagonal(α, β, γ)
+
+        e, u = np.linalg.eig(h_tri)
+        ul = np.dot(orth, u[:self.norb])
+        ur = np.dot(np.linalg.inv(u)[:, :self.norb], orth).T.conj()
+
+        for i in range(min(5, len(e))):
+            self.log.info(" %s: %s", i, util.format_value(e[i]))
+        self.log.info(" ...")
+
+        return e, ul, ur
+
+    @property
+    def moments(self):
+        return self.inp[0]
+
+    @property
+    def norb(self):
+        return self.moments.shape[-1]
+
+    @property
+    def nmom(self):
+        return self.moments.shape[0]
+
+    @property
+    def niter(self):
+        return (self.nmom - 2) // 2
+
+    @property
+    def dtype(self):
+        # Even for real asymmetric moments, the resulting excitations
+        # are in general complex
+        return np.complex128
+
+    @property
+    def complex(self):
+        return np.iscomplexobj(self.dtype)
+
+    @property
+    def real(self):
+        return not self.complex
+
+    @property
+    def zero(self):
+        return np.zeros((self.norb, self.norb), dtype=self.dtype)
 
 
-def kernel(t_occ, t_vir, nmom, debug=False, **kwargs):
-    """Kernel function for the block Lanczos method via the moments
-    of the spectral representation of the Greens' function.
+if __name__ == "__main__":
+    np.set_printoptions(edgeitems=100, linewidth=1000, precision=4)
 
-    Arguments
-    ---------
-    t_occ: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments of the occupied Green's function.
-    t_vir: numpy.ndarray (>=2*nmom+2, nphys, nphys)
-        Moments of the virtual Green's function.
-    nmom: int
-        Number of iterations of block Lanczos to perform.
+    norb = 5
+    naux = 100
 
-    Other kwargs are passed to the C object.
+    e = np.random.random((naux,)) * 5.0
+    v = np.random.random((norb, naux)) - 0.5
+    m1 = np.einsum("xk,yk,nk->nxy", v, v, e[None]**np.arange(10)[:, None])
+    solver = BlockLanczosSymmGF(m1)
+    e, v = solver.kernel()
+    m2 = np.einsum("xk,yk,nk->nxy", v, v, e[None]**np.arange(10)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)
 
-    Returns
-    -------
-    e: numpy.ndarray
-        Energies of the compressed self-energy auxiliaries.
-    v: numpy.ndarray
-        Coupling of the compressed self-energy auxiliaries.
-    """
+    e = np.random.random((naux,)) * 5.0
+    v = np.random.random((norb, naux)) - 0.5 + (np.random.random((norb, naux)) - 0.5) * 1.0j
+    m1 = np.einsum("xk,yk,nk->nxy", v, v.conj(), e[None]**np.arange(10)[:, None])
+    solver = BlockLanczosSymmGF(m1)
+    e, v = solver.kernel()
+    m2 = np.einsum("xk,yk,nk->nxy", v, v.conj(), e[None]**np.arange(10)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)
 
-    nphys = t_occ[0].shape[0]
+    e = np.random.random((naux,)) * 5.0
+    v = np.random.random((norb, naux)) - 0.5
+    u = np.random.random((norb, naux)) - 0.5
+    m1 = np.einsum("xk,yk,nk->nxy", v, u, e[None]**np.arange(10)[:, None])
+    solver = BlockLanczosNoSymmGF(m1)
+    e, v, u = solver.kernel()
+    m2 = np.einsum("xk,yk,nk->nxy", v, u.conj(), e[None]**np.arange(10)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)
 
-    m, b = block_lanczos(t_occ, nmom, debug=debug, **kwargs)
-    h_tri = linalg.build_block_tridiagonal(m, b)
-
-    e_occ, u_occ = np.linalg.eigh(h_tri)
-    b = sqrt_and_inv(t_occ[0], eps=kwargs.get("eps", None))[0]
-    u_occ = np.dot(b.T.conj(), u_occ[:nphys])
-
-    m, b = block_lanczos(t_vir, nmom, debug=debug, **kwargs)
-    h_tri = linalg.build_block_tridiagonal(m, b)
-
-    e_vir, u_vir = np.linalg.eigh(h_tri)
-    b = sqrt_and_inv(t_vir[0], eps=kwargs.get("eps", None))[0]
-    u_vir = np.dot(b.T.conj(), u_vir[:nphys])
-
-    e = np.concatenate([e_occ, e_vir], axis=0)
-    u = np.concatenate([u_occ, u_vir], axis=1).T
-
-    norm = np.linalg.norm(u, axis=0, keepdims=True)
-    norm[np.absolute(norm) == 0] = 1e-20
-    u /= norm
-    w, v = np.linalg.eigh(np.eye(e.size) - np.dot(u, u.T.conj()))
-    u = np.block([u, w[None] * v[:, abs(w) > 1e-20]])
-
-    h = np.dot(u.T.conj() * e[None], u)
-    e, v = np.linalg.eigh(h[nphys:, nphys:])
-    naux = e.size
-    v = np.block([
-            [np.eye(nphys), np.zeros((nphys, naux))],
-            [np.zeros((naux, nphys)), v],
-    ])
-
-    h = np.dot(np.dot(v.T.conj(), h), v)
-    e = np.diag(h[nphys:, nphys:])
-    v = h[:nphys, nphys:]
-
-    return e, v
-
-
-if __name__ == '__main__':
-    pass
+    e = np.random.random((naux,)) * 5.0
+    v = np.random.random((norb, naux)) - 0.5 + (np.random.random((norb, naux)) - 0.5) * 1.0j
+    u = np.random.random((norb, naux)) - 0.5 + (np.random.random((norb, naux)) - 0.5) * 1.0j
+    m1 = np.einsum("xk,yk,nk->nxy", v, u.conj(), e[None]**np.arange(10)[:, None])
+    solver = BlockLanczosNoSymmGF(m1)
+    e, v, u = solver.kernel()
+    m2 = np.einsum("xk,yk,nk->nxy", v, u.conj(), e[None]**np.arange(10)[:, None])
+    for i, (a, b) in enumerate(zip(m1, m2)):
+        a1 = a / np.max(np.abs(a))
+        b1 = b / np.max(np.abs(b))
+        assert np.allclose(a1, b1)
