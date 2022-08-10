@@ -64,7 +64,6 @@ class BlockLanczosSymmSE(BlockLanczosSymmGF):
         moments = np.asarray(moments)
         assert h_phys.shape == moments.shape[1:]
         assert np.allclose(h_phys, h_phys.T.conj())
-        assert np.allclose(moments, moments.swapaxes(1, 2).conj())
 
         Solver.__init__(self, h_phys, moments, **kwargs)
 

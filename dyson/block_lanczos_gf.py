@@ -43,7 +43,6 @@ class BlockLanczosSymmGF(Solver):
         self.eig_tol = 1e-14
 
         moments = np.asarray(moments)
-        assert np.allclose(moments, moments.swapaxes(1, 2).conj())
 
         Solver.__init__(self, moments, **kwargs)
 
@@ -54,7 +53,7 @@ class BlockLanczosSymmGF(Solver):
         w, v = np.linalg.eigh(array)
 
         if self.real:
-            mask = np.abs(w) >= 0.0
+            mask = w >= 0
             w, v = w[mask], v[:, mask]
             fac = 0.5
         else:
