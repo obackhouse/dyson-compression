@@ -1,3 +1,7 @@
+# Notice
+
+This codebase is now deprecated in favour of our new package, [dyson](https://github.com/BoothGroup/dyson). This new package will implement all the functionality contained in this repository, and this repository will no longer be updated.
+
 # Dyson Equation Compression
 
 This module provides functions to compress the spectral representation of a Green's function or self-energy linked by a Dyson equation
